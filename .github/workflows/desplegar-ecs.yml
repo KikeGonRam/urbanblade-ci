@@ -1,0 +1,353 @@
+name: Desplegar servicio a ECS (reutilizable)
+
+# Plantilla de despliegue controlado a AWS (ECS Fargate) de UrbanBlade, compartida por barber y frontend-urban.
+# Se llama desde `desplegar-staging.yml` de cada repositorio con `uses:`; ver README.md.
+#
+#  - Un job previo decide si el commit cambia lo que entra a la imagen. Si solo cambian documentación, workflows, pruebas
+#    o archivos de agentes, no despliega ni pide aprobación. Si trae migraciones o seeders (cuando el repositorio los declara),
+#    tampoco despliega solo: avisa y se lanza a mano con `confirmar_migraciones`.
+#  - El despliegue espera la aprobación del propietario en el entorno de GitHub indicado.
+#  - AWS se asume por OIDC con un rol de privilegio mínimo; no hay llaves de larga duración.
+#  - Antes de subir deja la imagen actual con la etiqueta rollback-<fecha>-pre-<sha>; si la verificación o las pruebas de humo
+#    fallan, revierte sola.
+#
+# El que llama define los disparadores (workflow_run tras el CI en main, y workflow_dispatch), la concurrencia y los permisos
+# del job, que deben incluir contents: read, actions: read e id-token: write.
+
+on:
+  workflow_call:
+    inputs:
+      ecr_repository:
+        description: 'Repositorio de ECR, por ejemplo urbanblade/barber'
+        type: string
+        required: true
+      ecs_service:
+        description: 'Servicio de ECS, por ejemplo uba-stg-barber'
+        type: string
+        required: true
+      ecs_container:
+        description: 'Nombre del contenedor dentro de la definición de tarea'
+        type: string
+        required: true
+      health_url:
+        description: 'URL base pública del servicio, sin barra final'
+        type: string
+        required: true
+      environment_url:
+        description: 'URL que GitHub muestra en el entorno de despliegue'
+        type: string
+        required: true
+      rutas_salud:
+        description: 'Rutas que deben responder 200 tras desplegar, separadas por espacios'
+        type: string
+        required: true
+      role_arn:
+        description: 'ARN del rol de AWS que asume el despliegue por OIDC'
+        type: string
+        required: true
+      ecs_cluster:
+        type: string
+        default: urbanblade-staging
+      aws_region:
+        type: string
+        default: us-east-1
+      environment:
+        description: 'Entorno de GitHub que exige la aprobación'
+        type: string
+        default: staging
+      dockerfile:
+        type: string
+        default: Dockerfile
+      ci_workflow:
+        description: 'Archivo del workflow de CI cuyo resultado en verde se exige'
+        type: string
+        default: ci.yml
+      patron_sin_imagen:
+        description: 'Expresión regular (grep -E) de archivos que NO cambian la imagen'
+        type: string
+        default: '(\.md$|^\.github/|^tests/|^\.claude/|^\.agents/|^\.codex/)'
+      rutas_migraciones:
+        description: 'Rutas de migraciones o seeders, separadas por espacios; vacío = el repositorio no tiene'
+        type: string
+        default: ''
+      confirmar_migraciones:
+        description: 'El propietario revisó y aprobó las migraciones de este despliegue'
+        type: boolean
+        default: false
+      script_humo:
+        description: 'Script de pruebas de humo dentro del repositorio; vacío = ninguno'
+        type: string
+        default: ''
+
+# Los permisos los fija el job que llama; esta plantilla solo los recorta por job.
+permissions: {}
+
+jobs:
+  decidir:
+    name: ¿El commit cambia la imagen?
+    # Solo un push a main del propio repositorio con el CI en verde. Un PR de un fork cuya rama se llame main no cumple
+    # `event == push` ni `head_repository`, así que no puede arrancar un despliegue.
+    if: >-
+      github.ref == 'refs/heads/main' && (
+        github.event_name == 'workflow_dispatch' || (
+          github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.event == 'push' &&
+          github.event.workflow_run.head_branch == 'main' &&
+          github.event.workflow_run.head_repository.full_name == github.repository
+        )
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Solo lee el repositorio para comparar el commit; sin acceso a AWS.
+    permissions:
+      contents: read
+    outputs:
+      desplegar: ${{ steps.cambios.outputs.desplegar }}
+    env:
+      # Commit que se despliega: con workflow_run es el del CI que terminó; a mano, el de la ejecución.
+      SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.SHA }}
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Comparar con el commit anterior de main
+        id: cambios
+        env:
+          EVENTO: ${{ github.event_name }}
+          PATRON_SIN_IMAGEN: ${{ inputs.patron_sin_imagen }}
+          RUTAS_MIGRACIONES: ${{ inputs.rutas_migraciones }}
+        run: |
+          # A mano siempre se despliega: ahí el propietario ya decidió y puede confirmar las migraciones.
+          if [ "$EVENTO" = "workflow_dispatch" ]; then
+            echo "desplegar=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # En una fusión, HEAD^ es la punta anterior de main: el diff es exactamente lo que trajo el PR.
+          cambios=$(git diff --name-only HEAD^ HEAD)
+          echo "Archivos del commit:"; echo "$cambios"
+          migraciones=""
+          if [ -n "$RUTAS_MIGRACIONES" ]; then
+            # shellcheck disable=SC2086
+            migraciones=$(git diff --name-only HEAD^ HEAD -- $RUTAS_MIGRACIONES || true)
+          fi
+          # Sin efecto en la imagen: lo que describe el patrón. Todo lo demás sí cuenta.
+          imagen=$(echo "$cambios" | grep -vE "$PATRON_SIN_IMAGEN" || true)
+          if [ -n "$migraciones" ]; then
+            echo "desplegar=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Este commit trae migraciones o seeders; no se despliega solo. Revísalos y lanza el workflow a mano con confirmar_migraciones."
+            echo "$migraciones"
+          elif [ -z "$imagen" ]; then
+            echo "desplegar=false" >> "$GITHUB_OUTPUT"
+            echo "El commit no cambia nada que entre a la imagen; no hay nada que desplegar."
+          else
+            echo "desplegar=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  desplegar:
+    name: Desplegar ${{ inputs.ecs_service }}
+    needs: decidir
+    # Se repiten las comprobaciones de origen del job `decidir`: este job construye código del commit del CI y pide el token
+    # OIDC, así que no debe depender solo de la salida de otro job para descartar un PR, un fork u otra rama.
+    if: >-
+      needs.decidir.outputs.desplegar == 'true' &&
+      github.ref == 'refs/heads/main' && (
+        github.event_name == 'workflow_dispatch' || (
+          github.event.workflow_run.event == 'push' &&
+          github.event.workflow_run.head_branch == 'main' &&
+          github.event.workflow_run.head_repository.full_name == github.repository
+        )
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    # contents: leer el código; actions: consultar el CI del commit; id-token: pedir el token OIDC de AWS.
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ inputs.environment_url }}
+    env:
+      AWS_REGION: ${{ inputs.aws_region }}
+      ECR_REPOSITORY: ${{ inputs.ecr_repository }}
+      ECS_CLUSTER: ${{ inputs.ecs_cluster }}
+      ECS_SERVICE: ${{ inputs.ecs_service }}
+      ECS_CONTAINER: ${{ inputs.ecs_container }}
+      HEALTH_URL: ${{ inputs.health_url }}
+      SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: CI en verde del commit exacto
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_WORKFLOW: ${{ inputs.ci_workflow }}
+        run: |
+          ok=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/${CI_WORKFLOW}/runs?head_sha=${SHA}&status=success" --jq '.total_count')
+          if [ "${ok:-0}" -lt 1 ]; then
+            echo "::error::El CI de ${SHA} no terminó en verde; no se despliega."
+            exit 1
+          fi
+
+      - name: Credenciales temporales de AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ inputs.role_arn }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: desplegar-${{ inputs.ecs_container }}-${{ github.run_id }}
+
+      - name: Inicio de sesión en ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      - name: Detener ante migraciones o seeders
+        id: migraciones
+        if: inputs.rutas_migraciones != ''
+        env:
+          CONFIRMADAS: ${{ inputs.confirmar_migraciones }}
+          RUTAS_MIGRACIONES: ${{ inputs.rutas_migraciones }}
+        run: |
+          # El SHA del despliegue anterior viaja en la etiqueta sha-<corto> de la imagen que hoy es `latest`.
+          # shellcheck disable=SC2016  # las comillas invertidas son sintaxis de JMESPath, no sustitución de shell
+          previa=$(aws ecr describe-images --repository-name "$ECR_REPOSITORY" --image-ids imageTag=latest \
+            --query 'imageDetails[0].imageTags[?starts_with(@, `sha-`)] | [0]' --output text 2>/dev/null || true)
+          if [ -z "$previa" ] || [ "$previa" = "None" ]; then
+            echo "No se conoce el commit desplegado antes; se exige confirmar las migraciones."
+            cambios="(commit anterior desconocido)"
+          else
+            base="${previa#sha-}"
+            # shellcheck disable=SC2086
+            cambios=$(git diff --name-only "$base" "$SHA" -- $RUTAS_MIGRACIONES || echo "(no se pudo comparar con $base)")
+          fi
+          if [ -n "$cambios" ] && [ "$CONFIRMADAS" != "true" ]; then
+            echo "::error::Este despliegue puede traer migraciones o seeders. Revisa y vuelve a lanzarlo con confirmar_migraciones:"
+            echo "$cambios"
+            exit 1
+          fi
+
+      - name: Respaldo de la imagen actual
+        id: respaldo
+        run: |
+          etiqueta="rollback-$(date -u +%Y%m%d)-pre-${SHA::7}"
+          manifiesto=$(aws ecr batch-get-image --repository-name "$ECR_REPOSITORY" --image-ids imageTag=latest \
+            --query 'images[0].imageManifest' --output text)
+          if [ -z "$manifiesto" ] || [ "$manifiesto" = "None" ]; then
+            echo "::warning::No hay imagen latest que respaldar (primer despliegue)."
+            exit 0
+          fi
+          aws ecr put-image --repository-name "$ECR_REPOSITORY" --image-tag "$etiqueta" --image-manifest "$manifiesto" > /dev/null
+          echo "etiqueta=$etiqueta" >> "$GITHUB_OUTPUT"
+
+      - name: Construir la imagen del commit
+        env:
+          REGISTRO: ${{ steps.ecr.outputs.registry }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+        run: |
+          corto="${SHA::7}"
+          docker build --pull -f "$DOCKERFILE" \
+            -t "$REGISTRO/$ECR_REPOSITORY:sha-$corto" -t "$REGISTRO/$ECR_REPOSITORY:latest" .
+
+      - name: Subir la imagen
+        id: subida
+        env:
+          REGISTRO: ${{ steps.ecr.outputs.registry }}
+        run: |
+          corto="${SHA::7}"
+          docker push "$REGISTRO/$ECR_REPOSITORY:sha-$corto"
+          docker push "$REGISTRO/$ECR_REPOSITORY:latest"
+          digest=$(aws ecr describe-images --repository-name "$ECR_REPOSITORY" --image-ids imageTag="sha-$corto" \
+            --query 'imageDetails[0].imageDigest' --output text)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Redesplegar el servicio
+        id: servicio
+        run: |
+          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" --force-new-deployment > /dev/null
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+
+      - name: Verificar el despliegue
+        env:
+          ESPERADO: ${{ steps.subida.outputs.digest }}
+          RUTAS_SALUD: ${{ inputs.rutas_salud }}
+        run: |
+          # La tarea en ejecución debe correr la imagen recién subida, no una anterior.
+          tareas=$(aws ecs list-tasks --cluster "$ECS_CLUSTER" --service-name "$ECS_SERVICE" --desired-status RUNNING --query 'taskArns' --output text)
+          [ -n "$tareas" ] || { echo "::error::El servicio no tiene tareas en ejecución."; exit 1; }
+          # shellcheck disable=SC2086
+          digests=$(aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks $tareas \
+            --query "tasks[].containers[?name=='$ECS_CONTAINER'].imageDigest[]" --output text)
+          for d in $digests; do
+            [ "$d" = "$ESPERADO" ] || { echo "::error::Una tarea corre $d y se esperaba $ESPERADO."; exit 1; }
+          done
+          for ruta in $RUTAS_SALUD; do
+            codigo=$(curl -s -o /dev/null -m 20 --retry 5 --retry-delay 6 --retry-all-errors -w '%{http_code}' "$HEALTH_URL$ruta")
+            echo "$ruta -> $codigo"
+            [ "$codigo" = "200" ] || { echo "::error::$ruta respondió $codigo."; exit 1; }
+          done
+
+      # Pruebas de humo de solo lectura que define cada repositorio: la salud solo prueba que el proceso responde; el script
+      # prueba que los datos y el contrato siguen bien. Reciben HEALTH_URL en el entorno. Si fallan, el paso de reversión
+      # (failure()) vuelve a la imagen anterior igual que con la verificación de arriba.
+      - name: Pruebas de humo
+        if: inputs.script_humo != ''
+        env:
+          SCRIPT_HUMO: ${{ inputs.script_humo }}
+        run: bash "$SCRIPT_HUMO"
+
+      - name: Vulnerabilidades de la imagen (informativo)
+        if: success()
+        # Informativo: nunca bloquea ni revierte el despliegue. Necesita el escaneo al subir de ECR (ecr_ciclo_de_vida.tf en
+        # urbanbladeTerraform); si todavía no está activo, avisa y sigue.
+        continue-on-error: true
+        run: |
+          corto="${SHA::7}"
+          estado=$(aws ecr describe-images --repository-name "$ECR_REPOSITORY" --image-ids imageTag="sha-$corto" \
+            --query 'imageDetails[0].imageScanStatus.status' --output text 2>/dev/null || true)
+          if [ -z "$estado" ] || [ "$estado" = "None" ]; then
+            echo "::notice::El escaneo al subir de ECR no está activo; no hay resumen de vulnerabilidades."
+            exit 0
+          fi
+          aws ecr wait image-scan-complete --repository-name "$ECR_REPOSITORY" --image-id imageTag="sha-$corto"
+          resumen=$(aws ecr describe-image-scan-findings --repository-name "$ECR_REPOSITORY" --image-id imageTag="sha-$corto" \
+            --query 'imageScanFindings.findingSeverityCounts' --output json)
+          echo "Vulnerabilidades por severidad: $resumen"
+          {
+            echo "### Vulnerabilidades de la imagen (escaneo básico de ECR)"
+            echo '```json'
+            echo "$resumen"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Revertir a la imagen anterior
+        if: failure() && steps.servicio.outcome != 'skipped' && steps.respaldo.outputs.etiqueta != ''
+        env:
+          ETIQUETA: ${{ steps.respaldo.outputs.etiqueta }}
+        run: |
+          echo "::warning::La verificación falló; se vuelve a la imagen $ETIQUETA."
+          manifiesto=$(aws ecr batch-get-image --repository-name "$ECR_REPOSITORY" --image-ids imageTag="$ETIQUETA" \
+            --query 'images[0].imageManifest' --output text)
+          aws ecr put-image --repository-name "$ECR_REPOSITORY" --image-tag latest --image-manifest "$manifiesto" > /dev/null
+          aws ecs update-service --cluster "$ECS_CLUSTER" --service "$ECS_SERVICE" --force-new-deployment > /dev/null
+          aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"
+
+      - name: Resumen
+        if: always()
+        env:
+          DIGEST: ${{ steps.subida.outputs.digest }}
+          RESPALDO: ${{ steps.respaldo.outputs.etiqueta }}
+          ESTADO: ${{ job.status }}
+        run: |
+          {
+            echo "### Despliegue de ${ECS_SERVICE} a ${ECS_CLUSTER}: ${ESTADO}"
+            echo "- Commit: \`${SHA::7}\`"
+            echo "- Imagen: \`${DIGEST:-sin subir}\`"
+            echo "- Respaldo: \`${RESPALDO:-ninguno}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
